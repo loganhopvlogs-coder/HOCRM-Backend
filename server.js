@@ -237,18 +237,13 @@ async function runSync(syncRequestId, approvedByName) {
 
     let freshRaw;
 
-    // Try to trigger a new Apify run. If that fails (e.g. no actor configured),
-    // fall back to pulling the existing dataset — this way the server never crashes.
-    try {
-      console.log("[sync] Triggering Apify actor run…");
-      const { runId, datasetId } = await triggerApifyRun();
-      console.log(`[sync] Run started: ${runId}. Polling every 60s…`);
-      const freshDatasetId = await waitForRun(runId);
-      freshRaw = await fetchDataset(freshDatasetId);
-    } catch (apifyErr) {
-      console.warn("[sync] Actor trigger failed, falling back to existing dataset:", apifyErr.message);
-      freshRaw = await fetchDataset(APIFY_DATASET_ID);
-    }
+    // Trigger a new Apify actor run — no fallback to old dataset
+    // If the actor fails, the sync fails cleanly and inventory is untouched
+    console.log("[sync] Triggering Apify actor run…");
+    const { runId, datasetId } = await triggerApifyRun();
+    console.log(`[sync] Run started: ${runId}. Polling every 60s…`);
+    const freshDatasetId = await waitForRun(runId);
+    freshRaw = await fetchDataset(freshDatasetId);
 
     if (!freshRaw || !freshRaw.length) {
       throw new Error("Apify returned 0 vehicles — aborting to avoid wiping inventory.");
@@ -304,50 +299,45 @@ app.get("/inventory", async (req, res) => {
       });
     }
 
-    // Cache expired — try to load from Supabase inventory table
-    try {
-      const rows = await supa("GET", "/inventory?select=*&active=eq.true&limit=5000&order=year.desc");
-      if (rows && rows.length) {
-        cachedInventory = rows.map((v, i) => ({
-          id:         i + 1,
-          stock:      v.stock,
-          year:       v.year,
-          make:       v.make,
-          model:      v.model,
-          price:      v.price,
-          mileage:    v.mileage,
-          location:   v.location,
-          type:       v.type,
-          color:      v.color,
-          image:      v.image,
-          listingUrl: v.listing_url,
-          condition:  v.condition,
-        }));
-        lastFetched = now;
-        return res.json({
-          success:     true,
-          count:       cachedInventory.length,
-          lastFetched: new Date(lastFetched).toISOString(),
-          syncStatus,
-          vehicles:    cachedInventory,
-        });
-      }
-    } catch (dbErr) {
-      console.warn("[inventory] Supabase load failed, falling back to Apify:", dbErr.message);
+    // Cache expired — load from Supabase inventory table (single source of truth)
+    // If the table is empty it means no sync has run yet — return empty with a message
+    const rows = await supa("GET", "/inventory?select=*&active=eq.true&limit=5000&order=year.desc");
+    if (rows && rows.length) {
+      cachedInventory = rows.map((v, i) => ({
+        id:         i + 1,
+        stock:      v.stock,
+        year:       v.year,
+        make:       v.make,
+        model:      v.model,
+        price:      v.price,
+        mileage:    v.mileage,
+        location:   v.location,
+        type:       v.type,
+        color:      v.color,
+        image:      v.image,
+        listingUrl: v.listing_url,
+        condition:  v.condition,
+      }));
+      lastFetched = now;
+      return res.json({
+        success:     true,
+        count:       cachedInventory.length,
+        lastFetched: new Date(lastFetched).toISOString(),
+        syncStatus,
+        vehicles:    cachedInventory,
+      });
     }
 
-    // Last resort — pull directly from Apify dataset (read-only, no new run)
-    console.log("[inventory] Fetching directly from Apify dataset…");
-    const raw = await fetchDataset(APIFY_DATASET_ID);
-    cachedInventory = raw.map((v, i) => ({ id: i + 1, ...normalize(v, i), listingUrl: v.listingUrl || v.url || "" }));
-    lastFetched = now;
-
-    res.json({
+    // Table is empty — no sync has run yet, return empty list
+    // Do NOT fall back to the static Apify dataset — that causes duplicate key errors on first sync
+    console.log("[inventory] Supabase inventory table is empty. Awaiting first sync.");
+    return res.json({
       success:     true,
-      count:       cachedInventory.length,
-      lastFetched: new Date(lastFetched).toISOString(),
+      count:       0,
+      lastFetched: new Date(now).toISOString(),
       syncStatus,
-      vehicles:    cachedInventory,
+      vehicles:    [],
+      message:     "No inventory yet — request a sync to populate.",
     });
   } catch (err) {
     console.error("[inventory] Error:", err.message);
