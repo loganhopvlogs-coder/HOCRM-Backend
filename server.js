@@ -14,7 +14,7 @@ app.use(express.json());
 // ── In-memory cache ───────────────────────────────────────────────────────
 let cachedInventory = [];
 let lastFetched     = null;
-const CACHE_TTL_MS  = 30 * 60 * 1000; // 30 min
+const CACHE_TTL_MS  = 5 * 60 * 1000; // 5 min
 
 // Track active sync so we never run two at once
 let syncInProgress  = false;
@@ -227,6 +227,14 @@ app.get("/inventory", async (req, res) => {
     console.error("[inventory] Error:", err.message);
     res.status(500).json({ success: false, error: err.message });
   }
+});
+
+// POST /inventory/bust-cache — called by local scraper after sync completes
+app.post("/inventory/bust-cache", async (req, res) => {
+  cachedInventory = [];
+  lastFetched     = null;
+  console.log("[inventory] Cache busted — will reload from Supabase on next request");
+  res.json({ success: true, message: "Cache cleared. Inventory will reload on next page visit." });
 });
 
 // GET /inventory/sync-status — lightweight poll endpoint for the frontend
