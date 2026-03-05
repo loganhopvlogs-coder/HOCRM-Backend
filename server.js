@@ -237,6 +237,17 @@ app.post("/inventory/bust-cache", async (req, res) => {
   res.json({ success: true, message: "Cache cleared. Inventory will reload on next page visit." });
 });
 
+// GET /agent/hoc-agent.js — serve latest agent file for one-click installer
+app.get("/agent/hoc-agent.js", (req, res) => {
+  const agentPath = path.join(__dirname, "hoc-agent.js");
+  if (require("fs").existsSync(agentPath)) {
+    res.setHeader("Content-Type", "application/javascript");
+    res.sendFile(agentPath);
+  } else {
+    res.status(404).json({ error: "Agent file not found on server" });
+  }
+});
+
 // GET /inventory/sync-status — lightweight poll endpoint for the frontend
 app.get("/inventory/sync-status", async (req, res) => {
   try {
