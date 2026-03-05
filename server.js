@@ -72,38 +72,7 @@ async function fetchDataset(datasetId) {
   return res.json();
 }
 
-// ── Trigger a new Apify actor run and return the runId ────────────────────
-async function triggerApifyRun() {
-  if (!APIFY_TOKEN) throw new Error("APIFY_TOKEN not set.");
-  // Use the saved Task so all scraper settings (Start URLs, page function) are preserved
-  const taskId = process.env.APIFY_TASK_ID || "heady_metric~house-of-cars-scrape-bot";
-  const url = `https://api.apify.com/v2/actor-tasks/${taskId}/runs?token=${APIFY_TOKEN}`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({}),
-  });
-  if (!res.ok) throw new Error(`Apify trigger → ${res.status}: ${await res.text()}`);
-  const j = await res.json();
-  return { runId: j.data.id, datasetId: j.data.defaultDatasetId };
-}
-
-// ── Poll Apify run status every 60s until SUCCEEDED or timeout ────────────
-async function waitForRun(runId) {
-  if (!APIFY_TOKEN) throw new Error("APIFY_TOKEN not set.");
-  const deadline = Date.now() + SYNC_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    await sleep(60000); // poll every 60 seconds — keeps resource usage minimal
-    const res = await fetch(`https://api.apify.com/v2/actor-runs/${runId}?token=${APIFY_TOKEN}`);
-    if (!res.ok) throw new Error(`Apify poll → ${res.status}`);
-    const j = await res.json();
-    const status = j.data.status;
-    console.log(`[sync] Apify run ${runId} status: ${status}`);
-    if (status === "SUCCEEDED") return j.data.defaultDatasetId;
-    if (["FAILED","ABORTED","TIMED-OUT"].includes(status)) throw new Error(`Apify run ${status}`);
-  }
-  throw new Error("Sync timed out after 20 minutes.");
-}
+// Apify functions removed — scraping handled by local scraper script
 
 // ── Diff + write inventory to Supabase in batches ─────────────────────────
 async function diffAndPersist(freshVehicles, syncRequestId) {
@@ -212,70 +181,10 @@ async function notifyAll(message, linkTab = "inventory") {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ─────────────────────────────────────────────────────────────────────────
-// BACKGROUND SYNC RUNNER
-// Called after an admin approves — runs async, does not block the response
+// NOTE: Scraping is now handled by the local scraper script (scraper.js)
+// run on any computer. The server just manages sync request state.
+// When the local scraper finishes it writes directly to Supabase.
 // ─────────────────────────────────────────────────────────────────────────
-async function runSync(syncRequestId, approvedByName) {
-  if (syncInProgress) {
-    console.log("[sync] Already in progress, skipping.");
-    return;
-  }
-
-  // Guard against zombie syncs (if server restarted mid-sync)
-  if (syncStartedAt && Date.now() - syncStartedAt > SYNC_TIMEOUT_MS) {
-    syncInProgress = false;
-  }
-
-  syncInProgress = true;
-  syncStartedAt  = Date.now();
-  console.log(`[sync] Starting sync for request ${syncRequestId}`);
-
-  try {
-    // Mark as running
-    await supa("PATCH", `/sync_requests?id=eq.${syncRequestId}`, {
-      status:     "running",
-      started_at: new Date().toISOString(),
-    });
-
-    let freshRaw;
-
-    // Trigger a new Apify actor run — no fallback to old dataset
-    // If the actor fails, the sync fails cleanly and inventory is untouched
-    console.log("[sync] Triggering Apify actor run…");
-    const { runId, datasetId } = await triggerApifyRun();
-    console.log(`[sync] Run started: ${runId}. Polling every 60s…`);
-    const freshDatasetId = await waitForRun(runId);
-    freshRaw = await fetchDataset(freshDatasetId);
-
-    if (!freshRaw || !freshRaw.length) {
-      throw new Error("Apify returned 0 vehicles — aborting to avoid wiping inventory.");
-    }
-
-    console.log(`[sync] Got ${freshRaw.length} vehicles from Apify. Diffing…`);
-    const normalized = freshRaw.map(normalize);
-    const { added, removed, total } = await diffAndPersist(normalized, syncRequestId);
-
-    // Update in-memory cache
-    cachedInventory = normalized.map((v, i) => ({ id: i + 1, ...v, listingUrl: v.listing_url }));
-    lastFetched     = Date.now();
-
-    const msg = `✅ Inventory sync complete · ${total} vehicles · ${added} added · ${removed} removed`;
-    console.log("[sync]", msg);
-    await notifyAll(msg, "inventory");
-
-  } catch (err) {
-    console.error("[sync] Error:", err.message);
-    await supa("PATCH", `/sync_requests?id=eq.${syncRequestId}`, {
-      status:        "failed",
-      completed_at:  new Date().toISOString(),
-      error_message: err.message,
-    });
-    await notifyAdmins(`❌ Inventory sync failed: ${err.message}`, "inventory");
-  } finally {
-    syncInProgress = false;
-    syncStartedAt  = null;
-  }
-}
 
 // ─────────────────────────────────────────────────────────────────────────
 // ROUTES
@@ -430,10 +339,9 @@ app.post("/inventory/approve-sync", async (req, res) => {
     // Notify everyone that sync is starting
     await notifyAll(`🔄 Inventory sync approved by ${approvedByName}. Updating inventory — check back in 10–20 minutes.`, "inventory");
 
-    // Fire off background sync — intentionally NOT awaited so response returns immediately
-    runSync(requestId, approvedByName).catch(e => console.error("[runSync unhandled]", e.message));
-
-    res.json({ success: true, message: "Sync approved and started." });
+    // Notify everyone — the local scraper script handles the actual scraping
+    // Whoever runs RUN-SCRAPER.bat on their computer will do the sync
+    res.json({ success: true, message: "Sync approved. Run the RUN-SCRAPER.bat script on your computer to start the sync." });
   } catch (err) {
     console.error("[approve-sync]", err.message);
     res.status(500).json({ success: false, error: err.message });
@@ -466,6 +374,59 @@ app.post("/inventory/deny-sync", async (req, res) => {
 
     res.json({ success: true });
   } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /inventory/pull-dataset — manually pull existing Apify dataset into Supabase
+// Used when the server crashed mid-sync but Apify finished successfully
+app.post("/inventory/pull-dataset", async (req, res) => {
+  try {
+    const { userRole, userId, userName, datasetId } = req.body;
+    if (!["Admin","Site Admin"].includes(userRole)) {
+      return res.status(403).json({ success: false, error: "Admins and Site Admins only." });
+    }
+
+    // Use provided datasetId or fall back to the default one
+    const targetDataset = datasetId || APIFY_DATASET_ID;
+    console.log(`[pull] Manually pulling dataset ${targetDataset}...`);
+
+    const freshRaw = await fetchDataset(targetDataset);
+    if (!freshRaw || !freshRaw.length) {
+      return res.status(400).json({ success: false, error: "Dataset is empty or not ready yet. Check Apify — the scraper may still be running." });
+    }
+
+    console.log(`[pull] Got ${freshRaw.length} vehicles. Writing to Supabase...`);
+    const normalized = freshRaw.map(normalize);
+
+    // Create a sync_request record to track this
+    const rows = await supa("POST", "/sync_requests", [{
+      requested_by:      userId,
+      requested_by_name: userName || "Manual Pull",
+      status:            "running",
+      started_at:        new Date().toISOString(),
+    }]);
+    const syncRequestId = rows[0].id;
+
+    // Run the diff in background — respond immediately so server doesnt time out
+    res.json({ success: true, message: `Pulling ${freshRaw.length} vehicles into Supabase. You'll get a notification when done.` });
+
+    // Background diff + persist
+    diffAndPersist(normalized, syncRequestId)
+      .then(async ({ added, removed, total }) => {
+        cachedInventory = normalized.map((v, i) => ({ id: i+1, ...v, listingUrl: v.listing_url }));
+        lastFetched = Date.now();
+        await notifyAll(`✅ Inventory pull complete · ${total} vehicles · ${added} added · ${removed} removed`, "inventory");
+        console.log(`[pull] Done. +${added} added, -${removed} removed, ${total} total`);
+      })
+      .catch(async (err) => {
+        console.error("[pull] Error:", err.message);
+        await supa("PATCH", `/sync_requests?id=eq.${syncRequestId}`, { status: "failed", error_message: err.message, completed_at: new Date().toISOString() });
+        await notifyAdmins(`❌ Inventory pull failed: ${err.message}`, "inventory");
+      });
+
+  } catch (err) {
+    console.error("[pull-dataset]", err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
