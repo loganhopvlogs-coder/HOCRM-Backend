@@ -4,12 +4,9 @@ const cors    = require("cors");
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
-// ── Credentials (set in Render environment variables) ─────────────────────
-const APIFY_TOKEN      = process.env.APIFY_TOKEN;
-const APIFY_ACTOR_ID   = process.env.APIFY_ACTOR_ID   || "apify/web-scraper";
-const APIFY_DATASET_ID = process.env.APIFY_DATASET_ID || "rcEKHccRtnYL70XU9";
-const SUPABASE_URL     = process.env.SUPABASE_URL     || "https://dmeigygmmxwmkyniizzj.supabase.co";
-const SUPABASE_KEY     = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRtZWlneWdtbXh3bWt5bmlpenpqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzI1NzU2NDEsImV4cCI6MjA4ODE1MTY0MX0.hTv4RICUBNWFNLsQEaZVqcbviqD0ZZSinwCzdSLRDJo";
+// ── Credentials ───────────────────────────────────────────────────────────
+const SUPABASE_URL = process.env.SUPABASE_URL || "https://dmeigygmmxwmkyniizzj.supabase.co";
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRtZWlneWdtbXh3bWt5bmlpenpqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzI1NzU2NDEsImV4cCI6MjA4ODE1MTY0MX0.hTv4RICUBNWFNLsQEaZVqcbviqD0ZZSinwCzdSLRDJo";
 
 app.use(cors());
 app.use(express.json());
@@ -44,33 +41,9 @@ async function supa(method, path, body) {
   return txt ? JSON.parse(txt) : null;
 }
 
-// ── Normalize Apify vehicle record ────────────────────────────────────────
-function normalize(v, i) {
-  return {
-    stock:       v.stock       || v.stockNumber || `HOC-${i}`,
-    year:        v.year        || 0,
-    make:        v.make        || "",
-    model:       v.model       || "",
-    price:       v.price       || 0,
-    mileage:     v.mileage     || "",
-    location:    v.location    || "",
-    type:        v.bodyType    || v.type || "",
-    color:       v.color       || "",
-    image:       v.image       || "",
-    listing_url: v.listingUrl  || v.url || "",
-    condition:   v.condition   || "Used",
-    raw:         v,
-  };
-}
+// normalize() removed — scraper writes data directly to Supabase
 
-// ── Pull current dataset from Apify (does NOT trigger a new run) ──────────
-async function fetchDataset(datasetId) {
-  if (!APIFY_TOKEN) throw new Error("APIFY_TOKEN not set.");
-  const url = `https://api.apify.com/v2/datasets/${datasetId}/items?format=json&clean=true&token=${APIFY_TOKEN}&limit=5000`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Apify dataset fetch → ${res.status}`);
-  return res.json();
-}
+// fetchDataset() removed — scraper writes directly to Supabase
 
 // Apify functions removed — scraping handled by local scraper script
 
@@ -378,58 +351,7 @@ app.post("/inventory/deny-sync", async (req, res) => {
   }
 });
 
-// POST /inventory/pull-dataset — manually pull existing Apify dataset into Supabase
-// Used when the server crashed mid-sync but Apify finished successfully
-app.post("/inventory/pull-dataset", async (req, res) => {
-  try {
-    const { userRole, userId, userName, datasetId } = req.body;
-    if (!["Admin","Site Admin"].includes(userRole)) {
-      return res.status(403).json({ success: false, error: "Admins and Site Admins only." });
-    }
 
-    // Use provided datasetId or fall back to the default one
-    const targetDataset = datasetId || APIFY_DATASET_ID;
-    console.log(`[pull] Manually pulling dataset ${targetDataset}...`);
-
-    const freshRaw = await fetchDataset(targetDataset);
-    if (!freshRaw || !freshRaw.length) {
-      return res.status(400).json({ success: false, error: "Dataset is empty or not ready yet. Check Apify — the scraper may still be running." });
-    }
-
-    console.log(`[pull] Got ${freshRaw.length} vehicles. Writing to Supabase...`);
-    const normalized = freshRaw.map(normalize);
-
-    // Create a sync_request record to track this
-    const rows = await supa("POST", "/sync_requests", [{
-      requested_by:      userId,
-      requested_by_name: userName || "Manual Pull",
-      status:            "running",
-      started_at:        new Date().toISOString(),
-    }]);
-    const syncRequestId = rows[0].id;
-
-    // Run the diff in background — respond immediately so server doesnt time out
-    res.json({ success: true, message: `Pulling ${freshRaw.length} vehicles into Supabase. You'll get a notification when done.` });
-
-    // Background diff + persist
-    diffAndPersist(normalized, syncRequestId)
-      .then(async ({ added, removed, total }) => {
-        cachedInventory = normalized.map((v, i) => ({ id: i+1, ...v, listingUrl: v.listing_url }));
-        lastFetched = Date.now();
-        await notifyAll(`✅ Inventory pull complete · ${total} vehicles · ${added} added · ${removed} removed`, "inventory");
-        console.log(`[pull] Done. +${added} added, -${removed} removed, ${total} total`);
-      })
-      .catch(async (err) => {
-        console.error("[pull] Error:", err.message);
-        await supa("PATCH", `/sync_requests?id=eq.${syncRequestId}`, { status: "failed", error_message: err.message, completed_at: new Date().toISOString() });
-        await notifyAdmins(`❌ Inventory pull failed: ${err.message}`, "inventory");
-      });
-
-  } catch (err) {
-    console.error("[pull-dataset]", err.message);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 async function getSyncStatus() {
