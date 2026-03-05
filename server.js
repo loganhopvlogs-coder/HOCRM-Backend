@@ -17,6 +17,25 @@ app.use(express.json());
 // ── In-memory cache ───────────────────────────────────────────────────────
 let cachedInventory = [];
 let lastFetched     = null;
+const CACHE_TTL_MS  = 30 * 60 * 1000; // 30 mconst express = require("express");
+const cors    = require("cors");
+
+const app  = express();
+const PORT = process.env.PORT || 3001;
+
+// ── Credentials (set in Render environment variables) ─────────────────────
+const APIFY_TOKEN      = process.env.APIFY_TOKEN;
+const APIFY_ACTOR_ID   = process.env.APIFY_ACTOR_ID   || "apify/web-scraper";
+const APIFY_DATASET_ID = process.env.APIFY_DATASET_ID || "rcEKHccRtnYL70XU9";
+const SUPABASE_URL     = process.env.SUPABASE_URL     || "https://dmeigygmmxwmkyniizzj.supabase.co";
+const SUPABASE_KEY     = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRtZWlneWdtbXh3bWt5bmlpenpqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzI1NzU2NDEsImV4cCI6MjA4ODE1MTY0MX0.hTv4RICUBNWFNLsQEaZVqcbviqD0ZZSinwCzdSLRDJo";
+
+app.use(cors());
+app.use(express.json());
+
+// ── In-memory cache ───────────────────────────────────────────────────────
+let cachedInventory = [];
+let lastFetched     = null;
 const CACHE_TTL_MS  = 30 * 60 * 1000; // 30 min
 
 // Track active sync so we never run two at once
@@ -108,42 +127,55 @@ async function diffAndPersist(freshVehicles, syncRequestId) {
   const BATCH = 50;
   let added = 0, removed = 0;
 
-  // 1. Fetch all currently active stocks from Supabase
-  const existing = await supa("GET", "/inventory?select=stock&active=eq.true&limit=10000");
+  // 1. Fetch all currently known stocks from Supabase (active only)
+  const existing       = await supa("GET", "/inventory?select=stock&active=eq.true&limit=10000");
   const existingStocks = new Set((existing || []).map(r => r.stock));
   const freshStocks    = new Set(freshVehicles.map(v => v.stock));
 
-  // 2. Upsert fresh vehicles in batches
-  for (let i = 0; i < freshVehicles.length; i += BATCH) {
-    const batch = freshVehicles.slice(i, i + BATCH).map(v => ({
+  // 2. Only insert vehicles NOT already in the DB — skip existing ones entirely
+  const newVehicles = freshVehicles.filter(v => !existingStocks.has(v.stock));
+  console.log(`[diff] ${freshVehicles.length} fresh · ${existingStocks.size} existing · ${newVehicles.length} new to insert`);
+
+  for (let i = 0; i < newVehicles.length; i += BATCH) {
+    const batch = newVehicles.slice(i, i + BATCH).map(v => ({
       ...v,
-      active:    true,
-      last_seen: new Date().toISOString(),
+      active:     true,
+      first_seen: new Date().toISOString(),
+      last_seen:  new Date().toISOString(),
     }));
-    await supa("POST", "/inventory?on_conflict=stock", batch);
-    // small pause between batches — keeps DB load low
-    if (i + BATCH < freshVehicles.length) await sleep(500);
+    await supa("POST", "/inventory", batch);
+    added += batch.length;
+    if (i + BATCH < newVehicles.length) await sleep(400);
   }
 
-  // 3. Count newly added
-  for (const v of freshVehicles) {
-    if (!existingStocks.has(v.stock)) added++;
-  }
-
-  // 4. Mark removed vehicles inactive in batches
+  // 3. Stocks that existed before but are NOT in the fresh scrape = delisted
   const toRemove = [...existingStocks].filter(s => !freshStocks.has(s));
+  console.log(`[diff] ${toRemove.length} vehicles to remove`);
+
   for (let i = 0; i < toRemove.length; i += BATCH) {
-    const batch = toRemove.slice(i, i + BATCH);
+    const batch  = toRemove.slice(i, i + BATCH);
     const inList = batch.map(s => `"${s}"`).join(",");
-    await supa("PATCH", `/inventory?stock=in.(${inList})`, {
-      active:    false,
-      last_seen: new Date().toISOString(),
-    });
+
+    // 3a. Delete any user-uploaded photos for these stocks first
+    try {
+      const photos = await supa("GET", `/vehicle_photos?stock=in.(${inList})&select=id`);
+      if (photos && photos.length) {
+        console.log(`[diff] Deleting ${photos.length} user photos for removed vehicles`);
+        const photoIds = photos.map(p => `"${p.id}"`).join(",");
+        await supa("DELETE", `/vehicle_photos?id=in.(${photoIds})`);
+      }
+    } catch (photoErr) {
+      console.warn("[diff] Photo cleanup error (non-fatal):", photoErr.message);
+    }
+
+    // 3b. Hard delete the inventory record
+    await supa("DELETE", `/inventory?stock=in.(${inList})`);
+    removed += batch.length;
+
     if (i + BATCH < toRemove.length) await sleep(300);
   }
-  removed = toRemove.length;
 
-  // 5. Update sync_request record
+  // 4. Update sync_request record with results
   await supa("PATCH", `/sync_requests?id=eq.${syncRequestId}`, {
     status:           "completed",
     completed_at:     new Date().toISOString(),
@@ -152,6 +184,7 @@ async function diffAndPersist(freshVehicles, syncRequestId) {
     total_vehicles:   freshVehicles.length,
   });
 
+  console.log(`[diff] Done. +${added} added, -${removed} removed, ${freshVehicles.length} total`);
   return { added, removed, total: freshVehicles.length };
 }
 
