@@ -17,25 +17,6 @@ app.use(express.json());
 // ── In-memory cache ───────────────────────────────────────────────────────
 let cachedInventory = [];
 let lastFetched     = null;
-const CACHE_TTL_MS  = 30 * 60 * 1000; // 30 mconst express = require("express");
-const cors    = require("cors");
-
-const app  = express();
-const PORT = process.env.PORT || 3001;
-
-// ── Credentials (set in Render environment variables) ─────────────────────
-const APIFY_TOKEN      = process.env.APIFY_TOKEN;
-const APIFY_ACTOR_ID   = process.env.APIFY_ACTOR_ID   || "apify/web-scraper";
-const APIFY_DATASET_ID = process.env.APIFY_DATASET_ID || "rcEKHccRtnYL70XU9";
-const SUPABASE_URL     = process.env.SUPABASE_URL     || "https://dmeigygmmxwmkyniizzj.supabase.co";
-const SUPABASE_KEY     = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRtZWlneWdtbXh3bWt5bmlpenpqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzI1NzU2NDEsImV4cCI6MjA4ODE1MTY0MX0.hTv4RICUBNWFNLsQEaZVqcbviqD0ZZSinwCzdSLRDJo";
-
-app.use(cors());
-app.use(express.json());
-
-// ── In-memory cache ───────────────────────────────────────────────────────
-let cachedInventory = [];
-let lastFetched     = null;
 const CACHE_TTL_MS  = 30 * 60 * 1000; // 30 min
 
 // Track active sync so we never run two at once
