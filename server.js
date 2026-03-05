@@ -75,13 +75,15 @@ async function fetchDataset(datasetId) {
 // ── Trigger a new Apify actor run and return the runId ────────────────────
 async function triggerApifyRun() {
   if (!APIFY_TOKEN) throw new Error("APIFY_TOKEN not set.");
-  const url = `https://api.apify.com/v2/acts/${APIFY_ACTOR_ID}/runs?token=${APIFY_TOKEN}`;
+  // Use the saved Task so all scraper settings (Start URLs, page function) are preserved
+  const taskId = process.env.APIFY_TASK_ID || "heady_metric~house-of-cars-scrape-bot";
+  const url = `https://api.apify.com/v2/actor-tasks/${taskId}/runs?token=${APIFY_TOKEN}`;
   const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ memory: 512 }), // keep memory low
+    body: JSON.stringify({}),
   });
-  if (!res.ok) throw new Error(`Apify trigger → ${res.status}`);
+  if (!res.ok) throw new Error(`Apify trigger → ${res.status}: ${await res.text()}`);
   const j = await res.json();
   return { runId: j.data.id, datasetId: j.data.defaultDatasetId };
 }
