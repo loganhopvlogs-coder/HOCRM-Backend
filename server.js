@@ -16,7 +16,7 @@ app.use(express.json());
 // ── In-memory cache ───────────────────────────────────────────────────────
 let cachedInventory = [];
 let lastFetched     = null;
-const CACHE_TTL_MS  = 5 * 60 * 1000; // 5 min
+const CACHE_TTL_MS  = 30 * 60 * 1000; // 30 min cache // 5 min
 
 // Track active sync so we never run two at once
 let syncInProgress  = false;
@@ -187,7 +187,18 @@ app.get("/inventory", async (req, res) => {
 
     // Cache expired — load from Supabase inventory table (single source of truth)
     // If the table is empty it means no sync has run yet — return empty with a message
-    const rows = await supa("GET", "/inventory?select=*&active=eq.true&limit=5000&order=year.desc");
+    // Paginate through ALL inventory — Supabase REST caps at 1000 per request
+    let rows = [];
+    let page = 0;
+    const PAGE_SIZE = 1000;
+    while (true) {
+      const batch = await supa("GET", `/inventory?select=*&active=eq.true&order=year.desc&limit=${PAGE_SIZE}&offset=${page * PAGE_SIZE}`);
+      if (!batch || !batch.length) break;
+      rows = rows.concat(batch);
+      if (batch.length < PAGE_SIZE) break; // last page
+      page++;
+    }
+    console.log(`[inventory] Fetched ${rows.length} total vehicles across ${page + 1} page(s)`);
     if (rows && rows.length) {
       cachedInventory = rows.map((v, i) => ({
         id:         i + 1,
