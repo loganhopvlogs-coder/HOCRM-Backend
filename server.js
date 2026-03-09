@@ -201,19 +201,25 @@ app.get("/inventory", async (req, res) => {
     console.log(`[inventory] Fetched ${rows.length} total vehicles across ${page + 1} page(s)`);
     if (rows && rows.length) {
       cachedInventory = rows.map((v, i) => ({
-        id:         i + 1,
-        stock:      v.stock,
-        year:       v.year,
-        make:       v.make,
-        model:      v.model,
-        price:      v.price,
-        mileage:    v.mileage,
-        location:   v.location,
-        type:       v.type,
-        color:      v.color,
-        image:      v.image,
-        listingUrl: v.listing_url,
-        condition:  v.condition,
+        id:              i + 1,
+        stock:           v.stock,
+        year:            v.year,
+        make:            v.make,
+        model:           v.model,
+        price:           v.price,
+        mileage:         v.mileage,
+        location:        v.location   || "",
+        type:            v.type       || v.body_type || v.bodyType || "",
+        color:           v.color      || v.exterior_color || "",
+        exterior_color:  v.exterior_color || v.color || "",
+        interior_color:  v.interior_color || "",
+        image:           v.image      || v.photos?.[0] || "",
+        photos:          v.photos     || [],
+        listingUrl:      v.listing_url || v.listingUrl || v.url || "",
+        condition:       v.condition  || "Used",
+        active:          v.active,
+        first_seen:      v.first_seen,
+        last_seen:       v.last_seen,
       }));
       lastFetched = now;
       return res.json({
@@ -258,6 +264,41 @@ app.get("/agent/hoc-agent.js", (req, res) => {
     res.sendFile(agentPath);
   } else {
     res.status(404).json({ error: "Agent file not found on server" });
+  }
+});
+
+// POST /inventory/ingest — scraper calls this after writing to Supabase to bust cache
+app.post("/inventory/ingest", async (req, res) => {
+  try {
+    const { syncRequestId, vehiclesAdded, vehiclesRemoved, total } = req.body;
+
+    // Bust the in-memory cache so next /inventory call fetches fresh data
+    cachedInventory = [];
+    lastFetched     = null;
+    console.log(`[ingest] Cache busted — scraper reported +${vehiclesAdded} added, -${vehiclesRemoved} removed, ${total} total`);
+
+    // Update sync_request record if provided
+    if (syncRequestId) {
+      try {
+        await supa("PATCH", `/sync_requests?id=eq.${syncRequestId}`, {
+          status:           "completed",
+          completed_at:     new Date().toISOString(),
+          vehicles_added:   vehiclesAdded   || 0,
+          vehicles_removed: vehiclesRemoved || 0,
+          total_vehicles:   total           || 0,
+        });
+      } catch(e) { console.warn("[ingest] sync_request update failed:", e.message); }
+    }
+
+    // Notify all users that inventory is fresh
+    try {
+      await notifyAll("🔄 Inventory has been updated with the latest vehicles.", "inventory");
+    } catch(e) { console.warn("[ingest] notify failed:", e.message); }
+
+    res.json({ success: true, message: "Cache cleared. Inventory will refresh on next load." });
+  } catch (err) {
+    console.error("[ingest]", err.message);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
